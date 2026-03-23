@@ -31,10 +31,52 @@ function detectPlatform() {
   return 'linux';
 }
 
-const PLATFORM    = detectPlatform();
-const WATCHDOG    = path.resolve(__dirname, 'watchdog.js');
-const NODE        = process.execPath;
-const LOG_DIR     = path.join(os.homedir(), '.openclaw-watchdog');
+const PLATFORM = detectPlatform();
+const LOG_DIR  = path.join(os.homedir(), '.openclaw-watchdog');
+
+// On Windows, if running from a UNC path (\\wsl$\...), convert to Windows path.
+// Also find the Windows-native node.exe instead of the WSL one.
+function toWinPath(p) {
+  // Already a Windows path (C:\...)
+  if (/^[A-Za-z]:\\/.test(p)) return p;
+  // UNC WSL path: \\wsl$\Ubuntu\home\... or \\wsl.localhost\Ubuntu\home\...
+  const uncMatch = p.match(/^[\\\/]{2}wsl[\$\.]?[\\\/\w]*?[\\\/]([^\\\/]+)(.*)/i);
+  if (uncMatch) {
+    // Convert via wsl.exe
+    try {
+      const wslPath = uncMatch[2].replace(/\\/g, '/');
+      return execSync(`wsl -d ${uncMatch[1]} -- wslpath -w "${wslPath}"`, { stdio: 'pipe' })
+        .toString().trim();
+    } catch (_) {}
+  }
+  return p;
+}
+
+function findWindowsNode() {
+  // If current node.exe is already a real Windows path, use it
+  if (/^[A-Za-z]:\\/.test(process.execPath)) return process.execPath;
+  // Otherwise find node.exe on the Windows PATH via where.exe
+  try {
+    const found = execSync('where.exe node.exe', { stdio: 'pipe' }).toString().trim().split('\n')[0].trim();
+    if (found && /^[A-Za-z]:\\/.test(found)) return found;
+  } catch (_) {}
+  // Common install locations
+  const candidates = [
+    path.join(process.env.PROGRAMFILES || 'C:\\Program Files', 'nodejs', 'node.exe'),
+    path.join(process.env.APPDATA || '', '..', 'Local', 'Programs', 'nodejs', 'node.exe'),
+    'C:\\Program Files\\nodejs\\node.exe',
+  ];
+  for (const c of candidates) {
+    try { if (fs.existsSync(c)) return c; } catch (_) {}
+  }
+  return 'node.exe';
+}
+
+const WATCHDOG = PLATFORM === 'windows'
+  ? toWinPath(path.resolve(__dirname, 'watchdog.js'))
+  : path.resolve(__dirname, 'watchdog.js');
+
+const NODE = PLATFORM === 'windows' ? findWindowsNode() : process.execPath;
 
 function info(m)  { console.log(`\x1b[32m[✓]\x1b[0m ${m}`); }
 function warn(m)  { console.log(`\x1b[33m[!]\x1b[0m ${m}`); }
@@ -61,9 +103,28 @@ function setupWindows() {
   step('Installing for Windows via Task Scheduler...');
 
   const taskName = 'OpenClawWatchdog';
-  const xmlPath  = path.join(os.tmpdir(), 'openclaw-watchdog.xml');
+  const winTemp  = process.env.TEMP || process.env.TMP || 'C:\\Windows\\Temp';
+  const xmlPath  = path.join(winTemp, 'openclaw-watchdog.xml');
 
-  fs.mkdirSync(LOG_DIR, { recursive: true });
+  // The watchdog script may live in WSL (\\wsl.localhost\...) which schtasks
+  // cannot use as a working directory. Copy a small launcher .bat into %APPDATA%
+  // that uses the UNC path — cmd.exe can run scripts via UNC even if it cannot
+  // cd into them.
+  const appData   = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+  const launcherDir = path.join(appData, 'openclaw-watchdog');
+  const launcherPath = path.join(launcherDir, 'start.bat');
+  const logPath   = path.join(appData, 'openclaw-watchdog', 'watchdog.log');
+
+  fs.mkdirSync(launcherDir, { recursive: true });
+
+  // Build the launcher bat. Use the UNC watchdog path directly.
+  const bat = `@echo off
+"${NODE}" "${WATCHDOG}" --log-file "${logPath}"
+`;
+  fs.writeFileSync(launcherPath, bat);
+  info(`Launcher written: ${launcherPath}`);
+  info(`Node    : ${NODE}`);
+  info(`Watchdog: ${WATCHDOG}`);
 
   const xml = `<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -89,9 +150,8 @@ function setupWindows() {
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>${NODE}</Command>
-      <Arguments>"${WATCHDOG}"</Arguments>
-      <WorkingDirectory>${path.dirname(WATCHDOG)}</WorkingDirectory>
+      <Command>${launcherPath}</Command>
+      <WorkingDirectory>${launcherDir}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>`;
@@ -105,7 +165,7 @@ function setupWindows() {
     console.log('');
     info(`Stop  : schtasks /End /TN "${taskName}"`);
     info(`Remove: schtasks /Delete /TN "${taskName}" /F`);
-    info(`Logs  : ${LOG_DIR}\\watchdog.log`);
+    info(`Logs  : ${logPath}`);
   } else {
     error('Failed to register task. Try running PowerShell as Administrator.');
     process.exit(1);
