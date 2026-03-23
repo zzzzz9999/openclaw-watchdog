@@ -2,93 +2,198 @@
 'use strict';
 
 /**
- * openclaw-watchdog
+ * openclaw-watchdog v2
  *
- * Monitors the OpenClaw gateway process and automatically restarts it
- * if it crashes or exits unexpectedly during task execution.
+ * Cross-platform watchdog for OpenClaw gateway.
+ * Supports: Windows · macOS · Linux · WSL
  *
- * How it works:
- *   1. Spawns `openclaw gateway` as a child process
- *   2. Monitors the process health via WebSocket ping to ws://127.0.0.1:18789
- *   3. On crash/exit: waits a backoff delay, then restarts
- *   4. On intentional shutdown (SIGTERM/SIGINT to watchdog): cleanly stops everything
- *   5. Writes logs to ~/.openclaw-watchdog/watchdog.log
+ * Usage:
+ *   node src/watchdog.js [options]
+ *
+ * Options:
+ *   --port <n>            Gateway port to monitor (default: 18789)
+ *   --restart-delay <ms>  Initial restart delay (default: 2000)
+ *   --max-delay <ms>      Max restart delay with backoff (default: 30000)
+ *   --max-restarts <n>    Give up after N restarts, 0 = unlimited (default: 0)
+ *   --health-interval <ms> Health check interval (default: 10000)
+ *   --health-timeout <ms>  Health check timeout (default: 3000)
+ *   --log-file <path>     Log file path (default: ~/.openclaw-watchdog/watchdog.log)
+ *   --no-log-file         Disable file logging
  */
 
-const { spawn } = require('child_process');
-const { program } = require('commander');
-const fs = require('fs');
-const path = require('path');
-const net = require('net');
-const os = require('os');
+const { spawn, execSync } = require('child_process');
+const { program }         = require('commander');
+const fs                  = require('fs');
+const path                = require('path');
+const net                 = require('net');
+const os                  = require('os');
 
-// ── Config ────────────────────────────────────────────────────────────────────
+// ── Platform ──────────────────────────────────────────────────────────────────
+
+function detectPlatform() {
+  if (process.platform === 'win32') return 'windows';
+  if (process.platform === 'darwin') return 'macos';
+  try {
+    const v = fs.readFileSync('/proc/version', 'utf8').toLowerCase();
+    if (v.includes('microsoft') || v.includes('wsl')) return 'wsl';
+  } catch (_) {}
+  return 'linux';
+}
+
+const PLATFORM = detectPlatform();
+
+// ── Resolve openclaw executable ───────────────────────────────────────────────
+
+function findExecutable() {
+  if (PLATFORM === 'windows') {
+    const candidates = [
+      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'OpenClaw', 'openclaw.exe'),
+      path.join(process.env.PROGRAMFILES || '', 'OpenClaw', 'openclaw.exe'),
+      path.join(process.env['PROGRAMFILES(X86)'] || '', 'OpenClaw', 'openclaw.exe'),
+    ];
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) return { cmd: c, args: [] }; } catch (_) {}
+    }
+    // Fall back to PATH
+    return { cmd: 'openclaw.exe', args: [] };
+  }
+
+  if (PLATFORM === 'macos') {
+    const candidates = [
+      '/usr/local/bin/openclaw',
+      '/opt/homebrew/bin/openclaw',
+      '/Applications/OpenClaw.app/Contents/MacOS/openclaw',
+      path.join(os.homedir(), 'Applications', 'OpenClaw.app', 'Contents', 'MacOS', 'openclaw'),
+    ];
+    for (const c of candidates) {
+      try { if (fs.existsSync(c)) return { cmd: c, args: [] }; } catch (_) {}
+    }
+    return { cmd: 'openclaw', args: [] };
+  }
+
+  // linux / wsl — use PATH
+  return { cmd: 'openclaw', args: [] };
+}
+
+// ── Resolve health-check host ─────────────────────────────────────────────────
+//
+// On Windows/macOS/Linux the gateway runs locally → 127.0.0.1
+// On WSL the gateway runs on the Windows host.
+//   WSL2: host is reachable via the default-route gateway IP
+//   WSL1: 127.0.0.1 reaches Windows directly
+//
+// We also set up a portproxy automatically on WSL2 so the Windows-side
+// 127.0.0.1:18789 is forwarded to the WSL-visible host IP.
+
+function getWSL2HostIP() {
+  try {
+    const out = execSync('ip route show default 2>/dev/null').toString();
+    const m   = out.match(/default via ([\d.]+)/);
+    if (m) return m[1];
+  } catch (_) {}
+  try {
+    const out = fs.readFileSync('/etc/resolv.conf', 'utf8');
+    const m   = out.match(/nameserver\s+([\d.]+)/);
+    if (m) return m[1];
+  } catch (_) {}
+  return null;
+}
+
+function isWSL2() {
+  try {
+    const out = execSync('wslinfo --wsl-version 2>/dev/null').toString().trim();
+    return out.includes('2');
+  } catch (_) {}
+  // Heuristic: WSL2 has a /run/WSL directory
+  return fs.existsSync('/run/WSL');
+}
+
+function ensurePortProxy(hostIP, port) {
+  // Add a Windows portproxy so that hostIP:port → 127.0.0.1:port
+  // This lets WSL reach a gateway that only listens on 127.0.0.1
+  try {
+    execSync(
+      `cmd.exe /c "netsh interface portproxy add v4tov4 listenport=${port} listenaddress=${hostIP} connectport=${port} connectaddress=127.0.0.1" 2>/dev/null`,
+      { stdio: 'pipe' }
+    );
+  } catch (_) {
+    // Non-fatal — user may not have admin rights; health check may still work
+  }
+}
+
+function resolveHealthHost(port) {
+  if (PLATFORM !== 'wsl') return '127.0.0.1';
+
+  if (!isWSL2()) return '127.0.0.1';   // WSL1: loopback works
+
+  const hostIP = getWSL2HostIP();
+  if (!hostIP) return '127.0.0.1';
+
+  ensurePortProxy(hostIP, port);
+  return hostIP;
+}
+
+// ── CLI ───────────────────────────────────────────────────────────────────────
 
 program
   .name('openclaw-watchdog')
-  .description('Keeps OpenClaw alive during task execution')
-  .option('-c, --command <cmd>', 'Command to launch OpenClaw', 'openclaw')
-  .option('-a, --args <args>', 'Arguments for OpenClaw', 'gateway')
-  .option('-p, --port <port>', 'OpenClaw gateway port to health-check', '18789')
-  .option('--max-restarts <n>', 'Max restarts before giving up (0 = unlimited)', '0')
-  .option('--restart-delay <ms>', 'Initial restart delay in ms', '2000')
-  .option('--max-delay <ms>', 'Maximum restart delay (exponential backoff cap)', '30000')
-  .option('--health-interval <ms>', 'Health check interval in ms', '10000')
-  .option('--health-timeout <ms>', 'Health check TCP timeout in ms', '3000')
-  .option('--log-file <path>', 'Log file path', path.join(os.homedir(), '.openclaw-watchdog', 'watchdog.log'))
-  .option('--no-log-file', 'Disable file logging')
+  .description('Keeps OpenClaw gateway alive on Windows, macOS, Linux, and WSL')
+  .option('-p, --port <port>',             'Gateway port',                   '18789')
+  .option('--restart-delay <ms>',          'Initial restart delay in ms',    '2000')
+  .option('--max-delay <ms>',              'Max restart delay (backoff cap)', '30000')
+  .option('--max-restarts <n>',            'Max restarts (0 = unlimited)',    '0')
+  .option('--health-interval <ms>',        'Health check interval in ms',    '10000')
+  .option('--health-timeout <ms>',         'Health check TCP timeout in ms', '3000')
+  .option('--log-file <path>',             'Log file path',
+    path.join(os.homedir(), '.openclaw-watchdog', 'watchdog.log'))
+  .option('--no-log-file',                 'Disable file logging')
   .parse(process.argv);
 
 const opts = program.opts();
+const PORT = parseInt(opts.port, 10);
+
+const { cmd: OPENCLAW_CMD, args: OPENCLAW_EXTRA_ARGS } = findExecutable();
+const OPENCLAW_ARGS = [...OPENCLAW_EXTRA_ARGS, 'gateway'];
+const HEALTH_HOST   = resolveHealthHost(PORT);
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 
-const logDir = path.dirname(opts.logFile);
-if (opts.logFile && !fs.existsSync(logDir)) {
-  fs.mkdirSync(logDir, { recursive: true });
-}
-
-let logStream = null;
 if (opts.logFile) {
-  logStream = fs.createWriteStream(opts.logFile, { flags: 'a' });
+  fs.mkdirSync(path.dirname(opts.logFile), { recursive: true });
 }
+const logStream = opts.logFile
+  ? fs.createWriteStream(opts.logFile, { flags: 'a' })
+  : null;
 
 function log(level, msg) {
   const line = `[${new Date().toISOString()}] [${level}] ${msg}`;
   console.log(line);
   if (logStream) logStream.write(line + '\n');
 }
-
-const info  = (m) => log('INFO ', m);
-const warn  = (m) => log('WARN ', m);
-const error = (m) => log('ERROR', m);
+const info  = m => log('INFO ', m);
+const warn  = m => log('WARN ', m);
+const error = m => log('ERROR', m);
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let child = null;
+let child        = null;
 let restartCount = 0;
 let currentDelay = parseInt(opts.restartDelay, 10);
-let shuttingDown = false;   // set when watchdog itself is asked to stop
-let healthTimer = null;
+let shuttingDown = false;
+let healthTimer  = null;
 let restartTimer = null;
 
 // ── Health check ──────────────────────────────────────────────────────────────
 
-/**
- * Returns true if OpenClaw's gateway port is accepting TCP connections.
- * This is faster and more reliable than a full WebSocket handshake.
- */
 function checkHealth() {
-  return new Promise((resolve) => {
-    const socket = new net.Socket();
+  return new Promise(resolve => {
+    const sock    = new net.Socket();
     const timeout = parseInt(opts.healthTimeout, 10);
-
-    socket.setTimeout(timeout);
-    socket.once('connect', () => { socket.destroy(); resolve(true); });
-    socket.once('error',   () => { socket.destroy(); resolve(false); });
-    socket.once('timeout', () => { socket.destroy(); resolve(false); });
-
-    socket.connect(parseInt(opts.port, 10), '127.0.0.1');
+    sock.setTimeout(timeout);
+    sock.once('connect', () => { sock.destroy(); resolve(true); });
+    sock.once('error',   () => { sock.destroy(); resolve(false); });
+    sock.once('timeout', () => { sock.destroy(); resolve(false); });
+    sock.connect(PORT, HEALTH_HOST);
   });
 }
 
@@ -96,60 +201,46 @@ function startHealthChecks() {
   if (healthTimer) clearInterval(healthTimer);
   healthTimer = setInterval(async () => {
     if (shuttingDown || !child) return;
-
     const alive = await checkHealth();
     if (!alive) {
-      warn(`Health check failed on port ${opts.port} — process may be frozen`);
-      // If the port is gone but the process is still "running", kill it so
-      // the exit handler triggers a restart.
+      warn(`Health check failed on ${HEALTH_HOST}:${PORT}`);
       if (child && !child.killed) {
-        warn('Killing unresponsive OpenClaw process to trigger restart');
+        warn('Killing unresponsive process to trigger restart');
         child.kill('SIGKILL');
       }
     }
   }, parseInt(opts.healthInterval, 10));
 }
 
-// ── Process management ────────────────────────────────────────────────────────
+// ── Spawn ─────────────────────────────────────────────────────────────────────
 
-function spawnOpenClaw() {
+function spawnGateway() {
   if (shuttingDown) return;
 
-  const cmd  = opts.command;
-  const args = opts.args.split(/\s+/).filter(Boolean);
+  info(`Spawning: ${OPENCLAW_CMD} ${OPENCLAW_ARGS.join(' ')}`);
 
-  info(`Starting OpenClaw: ${cmd} ${args.join(' ')}`);
-
-  child = spawn(cmd, args, {
-    stdio: 'inherit',   // share stdout/stderr with watchdog so logs stay visible
-    env: process.env,
-    detached: false,
+  child = spawn(OPENCLAW_CMD, OPENCLAW_ARGS, {
+    stdio: 'inherit',
+    env:   process.env,
+    ...(PLATFORM === 'windows' ? { windowsHide: true } : {}),
   });
 
-  child.on('error', (err) => {
-    error(`Failed to spawn OpenClaw: ${err.message}`);
+  child.on('error', err => {
+    error(`Spawn failed: ${err.message}`);
     scheduleRestart();
   });
 
   child.on('exit', (code, signal) => {
     if (shuttingDown) {
-      info('OpenClaw exited cleanly during watchdog shutdown');
+      info('Gateway exited during shutdown — OK');
       return;
     }
-
-    if (signal === 'SIGTERM' || signal === 'SIGINT') {
-      // Intentional stop — don't restart
-      info(`OpenClaw stopped by signal ${signal} — not restarting`);
-      return;
-    }
-
-    warn(`OpenClaw exited (code=${code ?? 'null'}, signal=${signal ?? 'none'})`);
+    warn(`Gateway exited (code=${code ?? 'null'}, signal=${signal ?? 'none'})`);
     scheduleRestart();
   });
 
   child.on('spawn', () => {
-    info(`OpenClaw started (pid=${child.pid})`);
-    // Reset backoff on successful start
+    info(`Gateway started (pid=${child.pid})`);
     currentDelay = parseInt(opts.restartDelay, 10);
     startHealthChecks();
   });
@@ -158,45 +249,31 @@ function spawnOpenClaw() {
 function scheduleRestart() {
   if (shuttingDown) return;
 
-  const maxRestarts = parseInt(opts.maxRestarts, 10);
-  if (maxRestarts > 0 && restartCount >= maxRestarts) {
-    error(`Reached max restarts (${maxRestarts}). Giving up.`);
+  const max = parseInt(opts.maxRestarts, 10);
+  if (max > 0 && restartCount >= max) {
+    error(`Reached max restarts (${max}). Giving up.`);
     process.exit(1);
   }
 
   restartCount++;
-  warn(`Scheduling restart #${restartCount} in ${currentDelay}ms...`);
-
-  restartTimer = setTimeout(() => {
-    spawnOpenClaw();
-  }, currentDelay);
-
-  // Exponential backoff, capped at maxDelay
-  const maxDelay = parseInt(opts.maxDelay, 10);
-  currentDelay = Math.min(currentDelay * 2, maxDelay);
+  warn(`Restart #${restartCount} in ${currentDelay}ms...`);
+  restartTimer = setTimeout(spawnGateway, currentDelay);
+  currentDelay = Math.min(currentDelay * 2, parseInt(opts.maxDelay, 10));
 }
 
-// ── Graceful shutdown ─────────────────────────────────────────────────────────
+// ── Shutdown ──────────────────────────────────────────────────────────────────
 
-function shutdown(signal) {
+function shutdown(sig) {
   if (shuttingDown) return;
   shuttingDown = true;
-
-  info(`Watchdog received ${signal} — shutting down gracefully`);
-
+  info(`Received ${sig} — shutting down`);
   if (healthTimer)  clearInterval(healthTimer);
   if (restartTimer) clearTimeout(restartTimer);
-
   if (child && !child.killed) {
-    info(`Sending SIGTERM to OpenClaw (pid=${child.pid})`);
+    info(`Stopping gateway (pid=${child.pid})`);
     child.kill('SIGTERM');
-
-    // Give it 5 seconds to exit cleanly, then force-kill
     setTimeout(() => {
-      if (child && !child.killed) {
-        warn('OpenClaw did not exit in time — sending SIGKILL');
-        child.kill('SIGKILL');
-      }
+      if (child && !child.killed) child.kill('SIGKILL');
       process.exit(0);
     }, 5000);
   } else {
@@ -206,22 +283,17 @@ function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT',  () => shutdown('SIGINT'));
+process.on('uncaughtException',  err    => error(`Uncaught: ${err.stack}`));
+process.on('unhandledRejection', reason => error(`Unhandled rejection: ${reason}`));
 
-// Prevent uncaught errors in the watchdog itself from taking everything down
-process.on('uncaughtException', (err) => {
-  error(`Uncaught exception in watchdog: ${err.stack}`);
-});
-process.on('unhandledRejection', (reason) => {
-  error(`Unhandled rejection in watchdog: ${reason}`);
-});
-
-// ── Entry ─────────────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 
 info('='.repeat(60));
-info('openclaw-watchdog starting');
-info(`Command : ${opts.command} ${opts.args}`);
-info(`Port    : ${opts.port}`);
-info(`Log     : ${opts.logFile || 'console only'}`);
+info('openclaw-watchdog v2');
+info(`Platform : ${PLATFORM}`);
+info(`Command  : ${OPENCLAW_CMD} ${OPENCLAW_ARGS.join(' ')}`);
+info(`Monitor  : ${HEALTH_HOST}:${PORT}`);
+info(`Log      : ${opts.logFile || 'console only'}`);
 info('='.repeat(60));
 
-spawnOpenClaw();
+spawnGateway();
