@@ -1,0 +1,18 @@
+{
+  "name": "openclaw-watchdog",
+  "version": "1.0.0",
+  "description": "Watchdog daemon that keeps OpenClaw alive during task execution",
+  "main": "src/watchdog.js",
+  "bin": {
+    "openclaw-watchdog": "./src/watchdog.js"
+  },
+  "scripts": {
+    "start": "node src/watchdog.js",
+    "install-service": "node src/install-service.js"
+  },
+  "dependencies": {
+    "commander": "^12.0.0"
+  },
+  "keywords": ["openclaw", "watchdog", "daemon", "process-manager"],
+  "license": "MIT"
+}
