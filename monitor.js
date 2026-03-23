@@ -10,7 +10,7 @@ const { spawn } = require("child_process");
 const os = require("os");
 const readline = require("readline");
 
-// ─── Config ────────────────────────────────────────────────────────────────
+// --- Config ---
 const CONFIG = {
   host: "127.0.0.1",
   port: parseInt(process.env.OPENCLAW_PORT || "18789"),
@@ -20,13 +20,13 @@ const CONFIG = {
   gatewayArgs: (process.env.GATEWAY_ARGS || "--port 18789 --verbose").split(" "),
 };
 
-// ─── State ──────────────────────────────────────────────────────────────────
+// --- State ---
 let gatewayProcess = null;
 let restartCount = 0;
 let isRunning = true;
 let lastStatus = null; // "up" | "down"
 
-// ─── Utilities ──────────────────────────────────────────────────────────────
+// --- Utilities ---
 function timestamp() {
   return new Date().toLocaleString();
 }
@@ -47,7 +47,7 @@ function clearLine() {
   process.stdout.write("\r\x1b[K");
 }
 
-// ─── Check if gateway port is open ──────────────────────────────────────────
+// --- Check if gateway port is open ---
 function checkGateway() {
   return new Promise((resolve) => {
     const socket = new net.Socket();
@@ -62,7 +62,7 @@ function checkGateway() {
   });
 }
 
-// ─── Start gateway process ───────────────────────────────────────────────────
+// --- Start gateway process ---
 function startGateway() {
   if (gatewayProcess) return;
 
@@ -104,7 +104,7 @@ function startGateway() {
   });
 }
 
-// ─── Stop gateway process ────────────────────────────────────────────────────
+// --- Stop gateway process ---
 function stopGateway() {
   if (!gatewayProcess) return;
   log("INFO", "Stopping gateway process...");
@@ -112,23 +112,23 @@ function stopGateway() {
   gatewayProcess = null;
 }
 
-// ─── Print status bar ────────────────────────────────────────────────────────
+// --- Print status bar ---
 let spinnerIdx = 0;
-const SPINNER = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER = ["|", "/", "-", "\\"];
 
 function printStatus(up) {
   if (!process.stdout.isTTY) return;
   const spin = SPINNER[spinnerIdx++ % SPINNER.length];
   const statusStr = up
-    ? "\x1b[32m● RUNNING\x1b[0m"
-    : "\x1b[31m● DOWN\x1b[0m";
+    ? "\x1b[32m[RUNNING]\x1b[0m"
+    : "\x1b[31m[DOWN]\x1b[0m";
   clearLine();
   process.stdout.write(
     `${spin} openclaw gateway ${statusStr}  port=${CONFIG.port}  restarts=${restartCount}  (Ctrl+C to quit)`
   );
 }
 
-// ─── Main monitor loop ───────────────────────────────────────────────────────
+// --- Main monitor loop ---
 async function monitorLoop() {
   log("INFO", `OpenClaw Gateway Monitor started`);
   log("INFO", `Monitoring ${CONFIG.host}:${CONFIG.port} every ${CONFIG.checkIntervalMs / 1000}s`);
@@ -146,7 +146,7 @@ async function monitorLoop() {
 
     if (!up && lastStatus !== "down") {
       if (process.stdout.isTTY) clearLine();
-      log("WARN", `Gateway is DOWN — will restart in ${CONFIG.restartDelayMs / 1000}s...`);
+      log("WARN", `Gateway is DOWN - will restart in ${CONFIG.restartDelayMs / 1000}s...`);
       lastStatus = "down";
     }
 
@@ -177,7 +177,7 @@ async function monitorLoop() {
   }
 }
 
-// ─── Graceful shutdown ───────────────────────────────────────────────────────
+// --- Graceful shutdown ---
 function shutdown() {
   isRunning = false;
   if (process.stdout.isTTY) clearLine();
@@ -195,7 +195,7 @@ if (process.platform === "win32") {
   rl.on("SIGINT", shutdown);
 }
 
-// ─── Entry point ─────────────────────────────────────────────────────────────
+// --- Entry point ---
 monitorLoop().catch((err) => {
   log("ERROR", err.message);
   process.exit(1);
