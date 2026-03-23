@@ -46,16 +46,23 @@ const PLATFORM = detectPlatform();
 
 function findExecutable() {
   if (PLATFORM === 'windows') {
+    const npm = process.env.APPDATA
+      ? path.join(process.env.APPDATA, 'npm')
+      : null;
     const candidates = [
-      path.join(process.env.LOCALAPPDATA || '', 'Programs', 'OpenClaw', 'openclaw.exe'),
-      path.join(process.env.PROGRAMFILES || '', 'OpenClaw', 'openclaw.exe'),
-      path.join(process.env['PROGRAMFILES(X86)'] || '', 'OpenClaw', 'openclaw.exe'),
-    ];
+      // npm global install (most common on Windows)
+      npm && path.join(npm, 'openclaw.cmd'),
+      npm && path.join(npm, 'openclaw.ps1'),
+      npm && path.join(npm, 'openclaw'),
+      // Standalone installer locations
+      process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'Programs', 'OpenClaw', 'openclaw.exe'),
+      process.env.PROGRAMFILES && path.join(process.env.PROGRAMFILES, 'OpenClaw', 'openclaw.exe'),
+    ].filter(Boolean);
     for (const c of candidates) {
       try { if (fs.existsSync(c)) return { cmd: c, args: [] }; } catch (_) {}
     }
-    // Fall back to PATH
-    return { cmd: 'openclaw.exe', args: [] };
+    // Last resort: hope it's on PATH
+    return { cmd: 'openclaw', args: [] };
   }
 
   if (PLATFORM === 'macos') {

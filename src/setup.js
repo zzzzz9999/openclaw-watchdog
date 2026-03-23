@@ -117,6 +117,18 @@ function setupWindows() {
 
   fs.mkdirSync(launcherDir, { recursive: true });
 
+  // Resolve openclaw command for the bat (same logic as watchdog.js findExecutable)
+  const npmBin = path.join(appData, 'npm');
+  let openclawCmd = 'openclaw';
+  for (const c of [
+    path.join(npmBin, 'openclaw.cmd'),
+    path.join(npmBin, 'openclaw.ps1'),
+    path.join(npmBin, 'openclaw'),
+  ]) {
+    try { if (fs.existsSync(c)) { openclawCmd = c; break; } } catch (_) {}
+  }
+  info(`openclaw : ${openclawCmd}`);
+
   // Build the launcher bat. Use the UNC watchdog path directly.
   const bat = `@echo off
 "${NODE}" "${WATCHDOG}" --log-file "${logPath}"
