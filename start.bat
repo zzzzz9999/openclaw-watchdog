@@ -35,7 +35,9 @@ echo Detected WSL filesystem. Launching via wsl.exe...
 echo.
 set "UNCPATH=%~dp0"
 if "%UNCPATH:~-1%"=="\" set "UNCPATH=%UNCPATH:~0,-1%"
-wsl.exe bash -lc "node \"$(wslpath '%UNCPATH:\=/%')/monitor.js\""
+
+:: Use bash -i to load .bashrc (so nvm node is on PATH), suppress job control warnings
+wsl.exe bash -ic "node \"$(wslpath '%UNCPATH:\=/%')/monitor.js\"" 2>&1
 if errorlevel 1 (
     echo.
     echo Monitor exited with an error.
