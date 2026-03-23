@@ -63,8 +63,14 @@ function checkGateway() {
 }
 
 // --- Start gateway process ---
-// Returns false if a fatal (non-retryable) error is detected
-let gatewayStderr = "";
+// Fatal patterns: errors that retrying will never fix
+const FATAL_PATTERNS = [
+  { pattern: /Node\.js.+required/,      msg: "Gateway requires a newer Node.js version.\n  Fix: nvm install 22 && nvm use 22 && nvm alias default 22" },
+  { pattern: /Missing config/,           msg: "Gateway is not configured.\n  Fix: run 'openclaw setup' first, then restart the monitor." },
+  { pattern: /openclaw setup/,           msg: "Gateway is not configured.\n  Fix: run 'openclaw setup' first, then restart the monitor." },
+];
+
+let gatewayOutput = "";
 
 function startGateway() {
   if (gatewayProcess) return;
@@ -72,7 +78,7 @@ function startGateway() {
   log("INFO", `Starting openclaw gateway: openclaw gateway ${CONFIG.gatewayArgs.join(" ")}`);
 
   const bin = process.platform === "win32" ? "openclaw.cmd" : "openclaw";
-  gatewayStderr = "";
+  gatewayOutput = "";
 
   gatewayProcess = spawn(bin, ["gateway", ...CONFIG.gatewayArgs], {
     stdio: ["ignore", "pipe", "pipe"],
@@ -80,25 +86,24 @@ function startGateway() {
     detached: false,
   });
 
-  gatewayProcess.stdout.on("data", (d) => {
-    const lines = d.toString().trim().split("\n");
-    lines.forEach((l) => l && console.log(`  \x1b[90m[gateway] ${l}\x1b[0m`));
-  });
+  function onData(d) {
+    const text = d.toString();
+    gatewayOutput += text;
+    text.trim().split("\n").forEach((l) => l && console.log(`  \x1b[90m[gateway] ${l}\x1b[0m`));
+  }
 
-  gatewayProcess.stderr.on("data", (d) => {
-    gatewayStderr += d.toString();
-    const lines = d.toString().trim().split("\n");
-    lines.forEach((l) => l && console.log(`  \x1b[33m[gateway] ${l}\x1b[0m`));
-  });
+  gatewayProcess.stdout.on("data", onData);
+  gatewayProcess.stderr.on("data", onData);
 
   gatewayProcess.on("exit", (code, signal) => {
     if (!isRunning) return;
-    // Detect fatal errors that retrying won't fix
-    if (gatewayStderr.includes("Node.js") && gatewayStderr.includes("required")) {
-      log("ERROR", "Gateway requires a newer Node.js version. Fix Node.js first, then restart the monitor.");
-      log("ERROR", "Run:  nvm install 22 && nvm use 22 && nvm alias default 22");
-      isRunning = false;
-      process.exit(1);
+    // Check for fatal errors
+    for (const { pattern, msg } of FATAL_PATTERNS) {
+      if (pattern.test(gatewayOutput)) {
+        log("ERROR", msg);
+        isRunning = false;
+        process.exit(1);
+      }
     }
     log("WARN", `Gateway process exited (code=${code}, signal=${signal})`);
     gatewayProcess = null;
@@ -106,7 +111,7 @@ function startGateway() {
 
   gatewayProcess.on("error", (err) => {
     if (err.code === "ENOENT") {
-      log("ERROR", "'openclaw' command not found. Is it installed? (npm install -g openclaw@latest)");
+      log("ERROR", "'openclaw' command not found.\n  Fix: npm install -g openclaw@latest");
       isRunning = false;
       process.exit(1);
     } else {
